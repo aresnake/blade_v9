@@ -1,18 +1,14 @@
-﻿# Blender/py/cache
+﻿# build/artifacts
+dist/
+*.zip
+_pack_*.tmp/
+
+# caches / logs
 __pycache__/
 *.pyc
-
-# Zips & dist
-blade_v9.zip
-dist/
-
-# Logs
 *.log
 blade_logs/
+logs/
 
-# OS/editor
-.DS_Store
-Thumbs.db
-
-# legacy
+# legacy jamais versionné
 blade_v9/ares/

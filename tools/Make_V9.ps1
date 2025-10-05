@@ -1,8 +1,10 @@
 <#
   Make_V9.ps1 — Pack & Install Blade v9 (compat PS5+)
-  - Staging robuste (fonctionne lancé via script, CI, ou console)
-  - Exclusions propres (legacy ares/, caches, artefacts)
-  - Arrêt Blender avant install
+
+  - Stoppe Blender si lancé pour libérer les fichiers
+  - Prépare un staging propre (exclusions solides)
+  - Zippe le staging
+  - Installe l’addon dans tous les répertoires addons Blender trouvés (Roaming/Blender/*/scripts/addons)
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -83,18 +85,8 @@ function Install-AddonFromZip([string]$ZipPath, [string]$AddonsDir, [string]$Add
 }
 
 try {
-  # -- Résolution robuste des chemins (script, CI, ou console interactive) --
-  if (-not $ProjectRoot) {
-    if ($PSScriptRoot) {
-      $ProjectRoot = Split-Path -Parent $PSScriptRoot
-    } elseif ($MyInvocation.MyCommand.Path) {
-      $scriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
-      $ProjectRoot = Split-Path -Parent $scriptDir
-    } else {
-      # Exécution directe en console: on prend le dossier courant comme racine
-      $ProjectRoot = (Get-Location).Path
-    }
-  }
+  $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+  if (-not $ProjectRoot) { $ProjectRoot = Split-Path $scriptDir -Parent }
 
   $sourceDir = Join-Path $ProjectRoot $AddonName
   $zipPath   = Join-Path $ProjectRoot "$AddonName.zip"
@@ -110,17 +102,13 @@ try {
 
   Stop-Blender
 
-  # Exclusions: legacy ares/, caches, artefacts, outils/tests, fichiers temporaires
+  # Exclusions robustes (inclut legacy ares/, scripts, tests, caches…)
   $exclusions = @(
-    "ares/*",           # legacy (exclu du package)
+    "ares/*",          # legacy jamais packé même s'il restait physiquement
     "__pycache__/*",
     ".git/*",
     "tests/*",
     "tools/*",
-    "dist/*",
-    "archives/*",
-    "logs/*",
-    "_zip_check/*",
     "*.ps1",
     "*.bat",
     "*.log",
@@ -131,7 +119,7 @@ try {
   )
 
   New-StagingFromSource -SourceDir $sourceDir -StagingDir $staging -ExcludePatterns $exclusions
-  New-ZipFromStaging     -StagingDir $staging  -ZipPath        $zipPath
+  New-ZipFromStaging -StagingDir $staging -ZipPath $zipPath
 
   $addonDirs = Get-AddonDirs
   if ($addonDirs.Count -eq 0) {
