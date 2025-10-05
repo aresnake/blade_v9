@@ -1,0 +1,440 @@
+bl_info = {
+    "name": "Blade v9",
+    "author": "Adrien / ARES",
+    "version": (9, 0, 0),
+    "blender": (4, 5, 0),
+    "location": "N-Panel > Blade v9",
+    "description": "Blade v9 Ops quick panel and safe defaults.",
+    "category": "3D View"
+}
+
+TAG = "[Blade v9]"
+import bpy, math
+from bpy.app.handlers import persistent
+
+TAG = "[Blade v9]"
+def log(msg): print(f"{TAG} {msg}")
+
+# ---------------- Prefs ----------------
+class BL8_AddonPreferences(bpy.types.AddonPreferences):
+    bl_idname = __name__.split(".")[0]
+    default_strength: bpy.props.FloatProperty(
+        name="Default Displace Strength", default=0.6, min=0.0, max=5.0
+    )
+    def draw(self, ctx):
+        col = self.layout.column(align=True)
+        col.prop(self, "default_strength")
+
+def _prefs():
+    try: return bpy.context.preferences.addons[__name__.split(".")[0]].preferences
+    except KeyError: return None
+
+# ---------------- Helpers ----------------
+def selected_meshes(ctx):
+    sel = list(ctx.selected_objects) if ctx.selected_objects else []
+    meshes = [o for o in sel if o.type=="MESH"]
+    if not meshes:
+        a = getattr(ctx.view_layer.objects, "active", None)
+        if a and a.type=="MESH": meshes=[a]
+    return meshes
+
+def report(op, ok, msg):
+    try: op.report({'INFO' if ok else 'WARNING'}, msg)
+    except: pass
+    log(msg)
+
+# ------- Material helpers -------
+def _in(node, names):
+    for n in names:
+        try: return node.inputs[n]
+        except Exception: pass
+    return None
+
+def ensure_material(name="BL8_Mat", rgba=(0.8,0.8,0.8,1.0), emission_strength=0.0):
+    mat = bpy.data.materials.get(name) or bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    nt = mat.node_tree; nodes=nt.nodes; links=nt.links
+    out = nodes.get("Material Output") or nodes.new("ShaderNodeOutputMaterial"); out.location=(400,0)
+    bsdf = next((n for n in nodes if n.type=="BSDF_PRINCIPLED"), None) or nodes.new("ShaderNodeBsdfPrincipled"); bsdf.location=(0,0)
+    try:
+        while out.inputs["Surface"].links: links.remove(out.inputs["Surface"].links[0])
+        links.new(bsdf.outputs.get("BSDF"), out.inputs["Surface"])
+    except Exception: pass
+    base = _in(bsdf, ["Base Color","BaseColor"])
+    if base: base.default_value = rgba
+    em_col = _in(bsdf, ["Emission Color","Emission"])
+    if em_col: em_col.default_value = (rgba[0],rgba[1],rgba[2],1.0)
+    em_str = _in(bsdf, ["Emission Strength","Emission Strength (Deprecated)","Emission Strength (deprecated)"])
+    if em_str: em_str.default_value = float(emission_strength)
+    return mat
+
+def assign_material(obj, mat):
+    try:
+        if obj.data.materials: obj.data.materials[0]=mat
+        else: obj.data.materials.append(mat)
+    except Exception: pass
+
+# ------- Geometry Nodes (b??ton) -------
+def _iface_has_out_geom(ng):
+    try:
+        iface = getattr(ng, "interface", None)
+        if iface:
+            for s in getattr(iface, "items_tree", []):
+                if getattr(s, "in_out","")== "OUTPUT" and getattr(s,"socket_type","")== "NodeSocketGeometry":
+                    return True
+    except Exception: pass
+    return False
+
+def _ensure_iface_inout_geom(ng):
+    try:
+        iface = ng.interface
+        if not any(getattr(s,"in_out","")=="INPUT" and getattr(s,"socket_type","")=="NodeSocketGeometry" for s in iface.items_tree):
+            iface.new_socket(name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+        if not any(getattr(s,"in_out","")=="OUTPUT" and getattr(s,"socket_type","")=="NodeSocketGeometry" for s in iface.items_tree):
+            iface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+        try: ng.interface_update(bpy.context)
+        except: pass
+    except Exception: pass
+
+def build_displace_group(group_name):
+    ng = bpy.data.node_groups.new(group_name, "GeometryNodeTree")
+    _ensure_iface_inout_geom(ng)
+    nodes=ng.nodes; links=ng.links
+    gi = nodes.new("NodeGroupInput"); gi.location=(-600,0)
+    go = nodes.new("NodeGroupOutput"); go.location=(400,0)
+    try: go.is_active_output = True
+    except: pass
+    setpos = nodes.new("GeometryNodeSetPosition"); setpos.location=(50,0)
+    normal = nodes.new("GeometryNodeInputNormal"); normal.location=(-350,-120)
+    vscale = nodes.new("ShaderNodeVectorMath"); vscale.operation="SCALE"; vscale.location=(-120,-60)
+    val = nodes.new("ShaderNodeValue"); val.name="BL8_Strength"; val.outputs[0].default_value=0.5; val.location=(-350,-20)
+    try:
+        links.new(gi.outputs["Geometry"], setpos.inputs["Geometry"])
+        links.new(normal.outputs[0], vscale.inputs[0])
+        links.new(val.outputs[0], vscale.inputs[1])
+        links.new(vscale.outputs[0], setpos.inputs["Offset"])
+        # sortie cruciale :
+        out_sock = None
+        for i in go.inputs:
+            if getattr(i,"name","")=="Geometry": out_sock=i; break
+        if out_sock is None and len(go.inputs)>0: out_sock = go.inputs[0]
+        links.new(setpos.outputs["Geometry"], out_sock)
+    except Exception: pass
+    try: ng.update_tag()
+    except: pass
+    return ng
+
+def get_or_repair_group(gname):
+    ng = bpy.data.node_groups.get(gname)
+    if not ng: return build_displace_group(gname)
+    try:
+        _ = ng.nodes["Group Input"]; _ = ng.nodes["Group Output"]
+    except KeyError:
+        try: bpy.data.node_groups.remove(ng, do_unlink=True)
+        except: pass
+        return build_displace_group(gname)
+    if not _iface_has_out_geom(ng):
+        _ensure_iface_inout_geom(ng)
+        if not _iface_has_out_geom(ng):
+            try: bpy.data.node_groups.remove(ng, do_unlink=True)
+            except: pass
+            return build_displace_group(gname)
+    return ng
+
+def ensure_displace_on(obj, strength=0.5):
+    gname=f"BL8_Displace_{obj.name}"
+    ng = get_or_repair_group(gname)
+    mod = next((m for m in obj.modifiers if m.type=="NODES" and m.name=="BL8_DisplaceGN"), None) or obj.modifiers.new(name="BL8_DisplaceGN", type="NODES")
+    try: mod.node_group = ng
+    except Exception: pass
+    _ensure_iface_inout_geom(ng)
+    if not _iface_has_out_geom(ng):
+        try: bpy.data.node_groups.remove(ng, do_unlink=True)
+        except: pass
+        ng = build_displace_group(gname)
+        try: mod.node_group = ng
+        except: pass
+    node = ng.nodes.get("BL8_Strength")
+    if node:
+        try: node.outputs[0].default_value=float(strength)
+        except Exception: pass
+    log(f"Displace GN ON {obj.name} (strength={strength:.3f})")
+
+def ensure_displace_off(obj):
+    removed=False
+    for m in list(obj.modifiers):
+        if m.type=="NODES" and m.name=="BL8_DisplaceGN":
+            obj.modifiers.remove(m); removed=True
+    log(("Displace GN OFF "+obj.name+" (removed)") if removed else ("Displace GN OFF "+obj.name+" (none)"))
+
+def set_displace_strength(obj, strength=0.5):
+    gname=f"BL8_Displace_{obj.name}"
+    ng = get_or_repair_group(gname)
+    node = ng.nodes.get("BL8_Strength")
+    if node:
+        try:
+            node.outputs[0].default_value=float(strength)
+            log(f"Displace Strength {obj.name} -> {strength:.3f}")
+        except Exception: pass
+
+# ---------------- Operators ----------------
+class BL8_OT_create_cube(bpy.types.Operator):
+    bl_idname="bl8.create_cube"; bl_label="Cube"; bl_options={'REGISTER','UNDO'}
+    radius: bpy.props.FloatProperty(default=1.0, min=0.01)
+    def execute(self, ctx):
+        bpy.ops.mesh.primitive_cube_add(size=self.radius*2.0, align='WORLD'); report(self,True,f"Cube created (radius={self.radius})"); return {'FINISHED'}
+
+class BL8_OT_create_sphere(bpy.types.Operator):
+    bl_idname="bl8.create_sphere"; bl_label="Sphere"; bl_options={'REGISTER','UNDO'}
+    radius: bpy.props.FloatProperty(default=1.0, min=0.01)
+    def execute(self, ctx):
+        bpy.ops.mesh.primitive_uv_sphere_add(radius=self.radius, align='WORLD'); report(self,True,f"Sphere created (radius={self.radius})"); return {'FINISHED'}
+
+class BL8_OT_create_plane(bpy.types.Operator):
+    bl_idname="bl8.create_plane"; bl_label="Plane"; bl_options={'REGISTER','UNDO'}
+    half: bpy.props.FloatProperty(default=1.0, min=0.01)
+    def execute(self, ctx):
+        bpy.ops.mesh.primitive_plane_add(size=self.half*2.0, align='WORLD'); report(self,True,f"Plane created (half={self.half})"); return {'FINISHED'}
+
+class BL8_OT_apply_basic_mat(bpy.types.Operator):
+    bl_idname="bl8.apply_basic_mat"; bl_label="Apply Basic Mat"; bl_options={'REGISTER','UNDO'}
+    r: bpy.props.FloatProperty(default=0.8, min=0, max=1)
+    g: bpy.props.FloatProperty(default=0.8, min=0, max=1)
+    b: bpy.props.FloatProperty(default=0.8, min=0, max=1)
+    em: bpy.props.FloatProperty(default=0.0, min=0, max=50)
+    @classmethod
+    def poll(cls, ctx): 
+        a = getattr(ctx.view_layer.objects, "active", None); return bool(a and a.type=="MESH")
+    def execute(self, ctx):
+        objs = selected_meshes(ctx)
+        if not objs: report(self,False,"Select a mesh object"); return {'CANCELLED'}
+        mat=ensure_material("BL8_Mat",(self.r,self.g,self.b,1.0),self.em)
+        for o in objs: assign_material(o,mat)
+        report(self,True,f"Material 'BL8_Mat' applied to {len(objs)} object(s)"); return {'FINISHED'}
+
+class BL8_OT_mat_preset(bpy.types.Operator):
+    bl_idname="bl8.mat_preset"; bl_label="Mat Preset"; bl_options={'REGISTER','UNDO'}
+    preset: bpy.props.EnumProperty(items=[('RED',"Red",""),('GREEN',"Green",""),('BLUE',"Blue","")], default='RED')
+    @classmethod
+    def poll(cls, ctx): 
+        a = getattr(ctx.view_layer.objects, "active", None); return bool(a and a.type=="MESH")
+    def execute(self, ctx):
+        objs = selected_meshes(ctx)
+        if not objs: report(self,False,"Select a mesh object"); return {'CANCELLED'}
+        col={'RED':(0.8,0.2,0.2,1.0),'GREEN':(0.2,0.8,0.2,1.0),'BLUE':(0.2,0.2,0.8,1.0)}[self.preset]
+        for o in objs:
+            mat=ensure_material(f"BL8_{self.preset}", col, 0.0); assign_material(o, mat)
+        report(self,True,f"Preset {self.preset} applied to {len(objs)} object(s)"); return {'FINISHED'}
+
+class BL8_OT_translate(bpy.types.Operator):
+    bl_idname="bl8.translate_axis"; bl_label="Translate Axis"; bl_options={'REGISTER','UNDO'}
+    axis: bpy.props.EnumProperty(items=[('X',"X",""),('Y',"Y",""),('Z',"Z","")], default='Z')
+    delta: bpy.props.FloatProperty(default=1.0)
+    @classmethod
+    def poll(cls, ctx): 
+        a = getattr(ctx.view_layer.objects, "active", None); return bool(a and a.type=="MESH")
+    def execute(self, ctx):
+        objs = selected_meshes(ctx)
+        if not objs: report(self,False,"Select a mesh object"); return {'CANCELLED'}
+        for o in objs:
+            if self.axis=='X': o.location.x += self.delta
+            elif self.axis=='Y': o.location.y += self.delta
+            else: o.location.z += self.delta
+        report(self,True,f"Translate {self.axis}{'+' if self.delta>=0 else ''}{self.delta} on {len(objs)} object(s)"); return {'FINISHED'}
+
+class BL8_OT_rotate_z(bpy.types.Operator):
+    bl_idname="bl8.rotate_z"; bl_label="Rotate Z"; bl_options={'REGISTER','UNDO'}
+    degrees: bpy.props.FloatProperty(default=15.0)
+    @classmethod
+    def poll(cls, ctx): 
+        a = getattr(ctx.view_layer.objects, "active", None); return bool(a and a.type=="MESH")
+    def execute(self, ctx):
+        objs = selected_meshes(ctx)
+        if not objs: report(self,False,"Select a mesh object"); return {'CANCELLED'}
+        ang = math.radians(self.degrees)
+        for o in objs: o.rotation_euler[2] += ang
+        report(self,True,f"Rotate Z by {self.degrees:.1f}?? on {len(objs)} object(s)"); return {'FINISHED'}
+
+class BL8_OT_scale(bpy.types.Operator):
+    bl_idname="bl8.scale_uniform"; bl_label="Scale x"; bl_options={'REGISTER','UNDO'}
+    factor: bpy.props.FloatProperty(default=1.2, min=0.001)
+    @classmethod
+    def poll(cls, ctx): 
+        a = getattr(ctx.view_layer.objects, "active", None); return bool(a and a.type=="MESH")
+    def execute(self, ctx):
+        objs = selected_meshes(ctx)
+        if not objs: report(self,False,"Select a mesh object"); return {'CANCELLED'}
+        for o in objs: o.scale = (o.scale.x*self.factor, o.scale.y*self.factor, o.scale.z*self.factor)
+        report(self,True,f"Scale x{self.factor} on {len(objs)} object(s)"); return {'FINISHED'}
+
+class BL8_OT_shade(bpy.types.Operator):
+    bl_idname="bl8.shade"; bl_label="Shade"; bl_options={'REGISTER','UNDO'}
+    smooth: bpy.props.BoolProperty(default=True)
+    @classmethod
+    def poll(cls, ctx): 
+        a = getattr(ctx.view_layer.objects, "active", None); return bool(a and a.type=="MESH")
+    def execute(self, ctx):
+        objs = selected_meshes(ctx)
+        if not objs: report(self,False,"Select a mesh object"); return {'CANCELLED'}
+        if self.smooth: bpy.ops.object.shade_smooth()
+        else: bpy.ops.object.shade_flat()
+        report(self,True,("Shade Smooth" if self.smooth else "Shade Flat")+f" on {len(objs)} object(s)"); return {'FINISHED'}
+
+class BL8_OT_displace_on(bpy.types.Operator):
+    bl_idname="bl8.displace_on"; bl_label="Displace ON (GN)"; bl_options={'REGISTER','UNDO'}
+    strength: bpy.props.FloatProperty(default=0.5, min=0.0, max=5.0)
+    @classmethod
+    def poll(cls, ctx): 
+        a = getattr(ctx.view_layer.objects, "active", None); return bool(a and a.type=="MESH")
+    def execute(self, ctx):
+        objs = selected_meshes(ctx)
+        if not objs: report(self,False,"Select a mesh object"); return {'CANCELLED'}
+        for o in objs: ensure_displace_on(o, self.strength)
+        report(self,True,f"Displace ON on {len(objs)} object(s) (strength={self.strength:.2f})"); return {'FINISHED'}
+
+class BL8_OT_displace_off(bpy.types.Operator):
+    bl_idname="bl8.displace_off"; bl_label="Displace OFF (GN)"; bl_options={'REGISTER','UNDO'}
+    @classmethod
+    def poll(cls, ctx): 
+        a = getattr(ctx.view_layer.objects, "active", None); return bool(a and a.type=="MESH")
+    def execute(self, ctx):
+        objs = selected_meshes(ctx)
+        if not objs: report(self,False,"Select a mesh object"); return {'CANCELLED'}
+        for o in objs: ensure_displace_off(o)
+        report(self,True,f"Displace OFF on {len(objs)} object(s)"); return {'FINISHED'}
+
+class BL8_OT_displace_strength(bpy.types.Operator):
+    bl_idname="bl8.displace_strength"; bl_label="Apply Strength (GN)"; bl_options={'REGISTER','UNDO'}
+    value: bpy.props.FloatProperty(default=0.5, min=0.0, max=5.0)
+    @classmethod
+    def poll(cls, ctx): 
+        a = getattr(ctx.view_layer.objects, "active", None); return bool(a and a.type=="MESH")
+    def execute(self, ctx):
+        objs = selected_meshes(ctx)
+        if not objs: report(self,False,"Select a mesh object"); return {'CANCELLED'}
+        for o in objs: set_displace_strength(o, self.value)
+        report(self,True,f"Strength -> {self.value:.2f} on {len(objs)} object(s)"); return {'FINISHED'}
+
+# ---------------- UI ----------------
+class VIEW3D_PT_bl8_ops(bpy.types.Panel):
+    bl_label="Blade - OPS"; bl_idname="VIEW3D_PT_bl8_ops"
+    bl_space_type='VIEW_3D'; bl_region_type='UI'; bl_category="Blade"
+    def draw(self, ctx): self.layout.label(text="Quick Operations")
+
+class VIEW3D_PT_bl8_ops_create(bpy.types.Panel):
+    bl_label="Create"; bl_idname="VIEW3D_PT_bl8_ops_create"; bl_parent_id="VIEW3D_PT_bl8_ops"
+    bl_space_type='VIEW_3D'; bl_region_type='UI'; bl_category="Blade"
+    def draw(self, ctx):
+        box=self.layout.box(); r=box.row(align=True)
+        r.operator("bl8.create_cube", text="Cube", icon='MESH_CUBE')
+        r.operator("bl8.create_sphere", text="Sphere", icon='MESH_UVSPHERE')
+        r.operator("bl8.create_plane", text="Plane", icon='MESH_PLANE')
+
+class VIEW3D_PT_bl8_ops_material(bpy.types.Panel):
+    bl_label="Material"; bl_idname="VIEW3D_PT_bl8_ops_material"; bl_parent_id="VIEW3D_PT_bl8_ops"
+    bl_space_type='VIEW_3D'; bl_region_type='UI'; bl_category="Blade"
+    def draw(self, ctx):
+        box=self.layout.box(); r=box.row(align=True)
+        r.operator("bl8.mat_preset", text="Red", icon='COLOR').preset='RED'
+        r.operator("bl8.mat_preset", text="Green", icon='COLOR').preset='GREEN'
+        r.operator("bl8.mat_preset", text="Blue", icon='COLOR').preset='BLUE'
+        r=box.row(align=True); o=r.operator("bl8.apply_basic_mat", text="Apply Basic", icon='MATERIAL'); o.r,o.g,o.b,o.em=0.8,0.8,0.8,0.0
+
+class VIEW3D_PT_bl8_ops_transform(bpy.types.Panel):
+    bl_label="Transform"; bl_idname="VIEW3D_PT_bl8_ops_transform"; bl_parent_id="VIEW3D_PT_bl8_ops"
+    bl_space_type='VIEW_3D'; bl_region_type='UI'; bl_category="Blade"
+    def draw(self, ctx):
+        box=self.layout.box()
+        for axis in ("X","Y","Z"):
+            r=box.row(align=True)
+            o=r.operator("bl8.translate_axis", text=f"{axis}+", icon='TRIA_RIGHT'); o.axis=axis; o.delta=1.0
+            o=r.operator("bl8.translate_axis", text=f"{axis}-", icon='TRIA_LEFT');  o.axis=axis; o.delta=-1.0
+        r=box.row(align=True)
+        o=r.operator("bl8.rotate_z", text="Rot Z +15", icon='DRIVER_ROTATIONAL_DIFFERENCE'); o.degrees=15.0
+        o=r.operator("bl8.rotate_z", text="Rot Z -15", icon='DRIVER_ROTATIONAL_DIFFERENCE'); o.degrees=-15.0
+        r=box.row(align=True)
+        o=r.operator("bl8.scale_uniform", text="Scale x0.8", icon='FULLSCREEN_EXIT');  o.factor=0.8
+        o=r.operator("bl8.scale_uniform", text="Scale x1.2", icon='FULLSCREEN_ENTER'); o.factor=1.2
+
+class VIEW3D_PT_bl8_ops_shade(bpy.types.Panel):
+    bl_label="Shade"; bl_idname="VIEW3D_PT_bl8_ops_shade"; bl_parent_id="VIEW3D_PT_bl8_ops"
+    bl_space_type='VIEW_3D'; bl_region_type='UI'; bl_category="Blade"
+    def draw(self, ctx):
+        box=self.layout.box(); r=box.row(align=True)
+        r.operator("bl8.shade", text="Smooth", icon='SHADING_SOLID').smooth=True
+        r.operator("bl8.shade", text="Flat", icon='MOD_EDGESPLIT').smooth=False
+
+class VIEW3D_PT_bl8_ops_displace(bpy.types.Panel):
+    bl_label="Displace (GN)"; bl_idname="VIEW3D_PT_bl8_ops_displace"; bl_parent_id="VIEW3D_PT_bl8_ops"
+    bl_space_type='VIEW_3D'; bl_region_type='UI'; bl_category="Blade"
+    def draw(self, ctx):
+        scn=ctx.scene; box=self.layout.box()
+        box.prop(scn, "bl8_disp_strength", text="Strength")
+        r=box.row(align=True)
+        o=r.operator("bl8.displace_on", text="ON", icon='ADD'); o.strength=scn.bl8_disp_strength
+        r.operator("bl8.displace_off", text="OFF", icon='X')
+        box.operator("bl8.displace_strength", text="Apply Strength", icon='CHECKMARK').value = scn.bl8_disp_strength
+
+# --------------- Init safe (no write in draw) ---------------
+_init_once = False
+def _init_scene_defaults():
+    global _init_once
+    if _init_once: return
+    p=_prefs()
+    if not p: return
+    for scn in bpy.data.scenes:
+        if scn.get("_bl8_init_done",0)!=1:
+            scn.bl8_disp_strength=float(p.default_strength)
+            scn["_bl8_init_done"]=1
+    _init_once=True
+    log("Scene defaults initialized (safe).")
+
+@persistent
+def _on_load_post(dummy):
+    global _init_once; _init_once=False
+    try: _init_scene_defaults()
+    except Exception as e: log(f"Init on load failed: {e}")
+
+def _timer_init():
+    try: _init_scene_defaults()
+    except Exception as e: log(f"Timer init failed: {e}")
+    return None
+
+# --------------- Register ---------------
+CLASSES = (
+    BL8_AddonPreferences,
+    BL8_OT_create_cube, BL8_OT_create_sphere, BL8_OT_create_plane,
+    BL8_OT_apply_basic_mat, BL8_OT_mat_preset,
+    BL8_OT_translate, BL8_OT_rotate_z, BL8_OT_scale, BL8_OT_shade,
+    BL8_OT_displace_on, BL8_OT_displace_off, BL8_OT_displace_strength,
+    VIEW3D_PT_bl8_ops, VIEW3D_PT_bl8_ops_create, VIEW3D_PT_bl8_ops_material,
+    VIEW3D_PT_bl8_ops_transform, VIEW3D_PT_bl8_ops_shade, VIEW3D_PT_bl8_ops_displace,
+)
+
+def register():
+    for c in CLASSES: bpy.utils.register_class(c)
+    if not hasattr(bpy.types.Scene, "bl8_disp_strength"):
+        bpy.types.Scene.bl8_disp_strength = bpy.props.FloatProperty(
+            name="BL8 Strength", default=0.5, min=0.0, max=5.0
+        )
+    if _on_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_on_load_post)
+    try: bpy.app.timers.register(_timer_init, first_interval=0.1)
+    except Exception as e: log(f"Timer register failed: {e}")
+    log("Add-on registered.")
+
+def unregister():
+    try:
+        if _on_load_post in bpy.app.handlers.load_post:
+            bpy.app.handlers.load_post.remove(_on_load_post)
+    except: pass
+    if hasattr(bpy.types.Scene, "bl8_disp_strength"):
+        del bpy.types.Scene.bl8_disp_strength
+    for c in reversed(CLASSES):
+        try: bpy.utils.unregister_class(c)
+        except: pass
+    log("Add-on unregistered.")
+
+
+
+

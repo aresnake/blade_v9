@@ -1,0 +1,120 @@
+param(
+  [string]$Root = "D:\V9",
+  [Parameter()][object]$PurgeInstalled = $true
+)
+
+$ErrorActionPreference = "Stop"
+
+function Convert-ToBool([object]$v){
+  if ($null -eq $v) { return $true }
+  $s = "$v"
+  switch -regex ($s.ToLower()) {
+    '^(true|1|yes|y)$'  { return $true }
+    '^(false|0|no|n)$'  { return $false }
+    default { try { return [bool]$v } catch { return $true } }
+  }
+}
+$DoPurge = Convert-ToBool $PurgeInstalled
+
+function Write-UTF8NoBOM([string]$Path,[string]$Content){
+  $enc = [System.Text.UTF8Encoding]::new($false)
+  [System.IO.File]::WriteAllText($Path,$Content,$enc)
+}
+
+$addonDir = Join-Path $Root "blade_v9"
+$init     = Join-Path $addonDir "__init__.py"
+$zipPath  = Join-Path $Root "blade_v9.zip"
+$archDir  = Join-Path $Root "archives"
+New-Item -ItemType Directory -Path $archDir -Force | Out-Null
+
+if (!(Test-Path $addonDir)) { throw "Dossier introuvable: $addonDir" }
+if (!(Test-Path $init))     { throw "__init__.py introuvable: $init" }
+
+Write-Host "==[1/6] Snapshot avant nettoyage =="
+$ts  = Get-Date -Format "yyyyMMdd_HHmmss"
+$pre = Join-Path $archDir ("blade_v9_preclean_"+$ts+".zip")
+if (Test-Path $zipPath) { Copy-Item $zipPath $pre -Force }
+
+Write-Host "==[2/6] Purge parasites =="
+Get-ChildItem $addonDir -Recurse -Force -Include "__pycache__", "*.pyc", ".DS_Store", "Thumbs.db" |
+  Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+Write-Host "==[3/6] Normalisation encodage sur *.py =="
+Get-ChildItem $addonDir -Recurse -Include *.py | ForEach-Object {
+  $p = $_.FullName
+  $bytes = [IO.File]::ReadAllBytes($p)
+  if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+    $bytes = $bytes[3..($bytes.Length-1)]
+  }
+  $txt = [Text.Encoding]::UTF8.GetString($bytes)
+  $txt = $txt.Replace([string][char]0xFEFF,'')
+  $txt = $txt.Replace('’',"'").Replace('“','"').Replace('”','"').Replace('–','-').Replace('—','-')
+  Write-UTF8NoBOM $p $txt
+}
+
+Write-Host "==[3b] Répare bl_info source =="
+$src = Get-Content $init -Raw -Encoding UTF8
+
+# Retire lignes orphelines "x, y, z),"
+$srcLines = $src -split "(`r`n|`n)"
+$srcLines = $srcLines | Where-Object { $_ -notmatch '^\s*\d+\s*,\s*\d+\s*,\s*\d+\)\s*,?\s*$' }
+$src = ($srcLines -join "`r`n") + "`r`n"
+
+$header = @"
+bl_info = {
+    "name": "Blade v9",
+    "author": "Adrien / ARES",
+    "version": (9, 0, 0),
+    "blender": (4, 5, 0),
+    "location": "N-Panel > Blade v9",
+    "description": "Blade v9 Ops quick panel and safe defaults.",
+    "category": "3D View"
+}
+
+"@
+
+# Si bl_info absent ou sans version, on remplace complètement
+if ($src -notmatch '(?s)^\s*bl_info\s*=\s*\{.*?\}') {
+  $src = $header + $src
+} elseif ($src -notmatch '(?s)bl_info\s*=\s*\{.*?["'']version["'']\s*:\s*\(\d+\s*,\s*\d+\s*,\s*\d+\).*?\}') {
+  $src = [regex]::Replace($src,'(?s)^\s*bl_info\s*=\s*\{.*?\}',$header,1)
+}
+
+# Garantir import du panneau extras
+if ($src -notmatch '^\s*from\s+\.\ares\.ui\s+import\s+extras_v9' -and $src -notmatch '^\s*from \.ares\.ui import extras_v9') {
+  if ($src -match '^\s*import\s+bpy.*$') {
+    $src = [regex]::Replace($src,'^\s*import\s+bpy.*$', '$0' + "`r`nfrom .ares.ui import extras_v9", 1, 'IgnoreCase, Multiline')
+  } else {
+    $src = "import bpy`r`nfrom .ares.ui import extras_v9`r`n" + $src
+  }
+}
+
+Write-UTF8NoBOM $init $src
+
+Write-Host "==[4/6] Supprime dossiers vides =="
+Get-ChildItem $addonDir -Recurse -Directory | Where-Object {
+  @(Get-ChildItem $_.FullName -Recurse -Force -ErrorAction SilentlyContinue).Count -eq 0
+} | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+Write-Host "==[5/6] Rezip structure correcte (blade_v9/ en racine) =="
+if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[System.IO.Compression.ZipFile]::CreateFromDirectory($addonDir,$zipPath,[System.IO.Compression.CompressionLevel]::Optimal,$true)
+
+if ($DoPurge) {
+  Write-Host "==[5b] Purge copies installees (user/contrib/sandbox) =="
+  $paths = @(
+    (Join-Path $env:APPDATA "Blender Foundation\Blender\4.5\scripts\addons\blade_v9"),
+    (Join-Path $env:APPDATA "Blender Foundation\Blender\4.5\scripts\addons_contrib\blade_v9"),
+    (Join-Path $env:TEMP    "bl_user_scripts_empty\addons\blade_v9")
+  )
+  foreach($p in $paths){
+    if ($p -and (Test-Path $p)) {
+      Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue
+      Write-Host "Purged: $p"
+    }
+  }
+}
+
+Write-Host "==[6/6] OK. Snapshot: $pre"
+Write-Host "Zip pret: $zipPath"
