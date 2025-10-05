@@ -13,3 +13,6 @@ blade_logs/
 # OS/editor
 .DS_Store
 Thumbs.db
+
+# legacy
+blade_v9/ares/
